@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define VC_EXTRALEAN
 #include <Windows.h>
+#include <Shlwapi.h>
 
 #include <cstdio>
 #include <inttypes.h>
@@ -113,6 +114,17 @@ static struct
 
 	size_t totalBytesWritten = 0;
 } s_state;
+
+static struct
+{
+	std::counting_semaphore< IO_THREAD_MAX_COUNT > pendingIOWork{ 0 };
+	std::binary_semaphore pendingIOWorkComplete{ 0 };
+	size_t threadCount = 0;
+
+	uint64_t blockCount;
+
+	uint64_t baseBlockIdx;
+} s_sharedIOThreadState;
 
 // ================================== CRC-32 from Stephan Baume ==================================
 // Modified to be simpler to integrate in this code.
@@ -260,29 +272,68 @@ void FlushFileThread()
 	}
 }
 
+void BlockCopyThread(uint64_t threadIdx)
+{
+	for ( ;; )
+	{
+		s_sharedIOThreadState.pendingIOWork.acquire();
+
+		if ( s_sharedIOThreadState.threadCount == 0 )
+			break;
+
+		const size_t blocksPerThread = s_sharedIOThreadState.blockCount / s_sharedIOThreadState.threadCount;
+		const size_t blockStartIdx = blocksPerThread * threadIdx;
+		const size_t blockEndIdx = (threadIdx == s_sharedIOThreadState.threadCount - 1) ? s_sharedIOThreadState.blockCount : blockStartIdx + blocksPerThread;
+		for ( size_t currBlockIdx = blockStartIdx; currBlockIdx < blockEndIdx; ++currBlockIdx )
+		{
+			const size_t actualBlockIdx = s_sharedIOThreadState.baseBlockIdx + currBlockIdx;
+			const uint32_t crc32 = crc32_16bytes_prefetch( s_state.srcFileBytes + FILE_BLOCK_SIZE * currBlockIdx, FILE_BLOCK_SIZE, 0, 256 );
+			if ( actualBlockIdx >= s_state.dstFileBlockHashData->blockCount || crc32 != s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] )
+			{
+				printf( "Block %llu differs, copying...\n", actualBlockIdx );
+				memcpy( s_state.dstFileBytes + FILE_BLOCK_SIZE * currBlockIdx, s_state.srcFileBytes + FILE_BLOCK_SIZE * currBlockIdx, FILE_BLOCK_SIZE );
+				s_state.totalBytesWritten += FILE_BLOCK_SIZE;
+			}
+			else
+			{
+				printf( "Block %llu has no changes, skipping.\n", actualBlockIdx );
+			}
+			s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] = crc32;
+		}
+
+		if ( threadIdx == s_sharedIOThreadState.threadCount - 1 )
+			s_sharedIOThreadState.pendingIOWorkComplete.release();
+	}
+}
+
 inline void DeltaCopyFileView( uint64_t offset, uint64_t viewSize )
 {
 	s_state.srcFileBytes = static_cast< uint8_t* >(MapViewOfFile( s_state.srcFileMappingHnd, FILE_MAP_READ, offset >> 32, offset & UINT32_MAX, viewSize ));
 	s_state.dstFileBytes = static_cast< uint8_t* >(MapViewOfFile( s_state.dstFileMappingHnd, FILE_MAP_WRITE, offset >> 32, offset & UINT32_MAX, viewSize ));
 
 	const size_t blockCount = viewSize / FILE_BLOCK_SIZE;
-	for ( size_t blockIdx = 0; blockIdx < blockCount; ++blockIdx )
-	{
-		const size_t actualBlockIdx = offset / FILE_BLOCK_SIZE + blockIdx;
-		const uint32_t crc32 = crc32_16bytes_prefetch( s_state.srcFileBytes + FILE_BLOCK_SIZE * blockIdx, FILE_BLOCK_SIZE, 0, 256 );
-		if ( actualBlockIdx >= s_state.dstFileBlockHashData->blockCount || crc32 != s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] )
-		{
-			printf( "Block %llu differs, copying...", actualBlockIdx );
-			memcpy( s_state.dstFileBytes + FILE_BLOCK_SIZE * blockIdx, s_state.srcFileBytes + FILE_BLOCK_SIZE * blockIdx, FILE_BLOCK_SIZE );
-			s_state.totalBytesWritten += FILE_BLOCK_SIZE;
-			printf( "done\n" );
-		}
-		else
-		{
-			printf( "Block %llu has no changes, skipping.\n", actualBlockIdx );
-		}
-		s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] = crc32;
-	}
+	//for ( size_t blockIdx = 0; blockIdx < blockCount; ++blockIdx )
+	//{
+	//	const size_t actualBlockIdx = offset / FILE_BLOCK_SIZE + blockIdx;
+	//	const uint32_t crc32 = crc32_16bytes_prefetch( s_state.srcFileBytes + FILE_BLOCK_SIZE * blockIdx, FILE_BLOCK_SIZE, 0, 256 );
+	//	if ( actualBlockIdx >= s_state.dstFileBlockHashData->blockCount || crc32 != s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] )
+	//	{
+	//		printf( "Block %llu differs, copying...", actualBlockIdx );
+	//		memcpy( s_state.dstFileBytes + FILE_BLOCK_SIZE * blockIdx, s_state.srcFileBytes + FILE_BLOCK_SIZE * blockIdx, FILE_BLOCK_SIZE );
+	//		s_state.totalBytesWritten += FILE_BLOCK_SIZE;
+	//		printf( "done\n" );
+	//	}
+	//	else
+	//	{
+	//		printf( "Block %llu has no changes, skipping.\n", actualBlockIdx );
+	//	}
+	//	s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] = crc32;
+	//}
+
+	s_sharedIOThreadState.baseBlockIdx = offset / FILE_BLOCK_SIZE;
+	s_sharedIOThreadState.blockCount = blockCount;
+	s_sharedIOThreadState.pendingIOWork.release( s_sharedIOThreadState.threadCount );
+	s_sharedIOThreadState.pendingIOWorkComplete.acquire();
 
 	if ( blockCount * FILE_BLOCK_SIZE < viewSize )
 	{
@@ -324,8 +375,12 @@ inline void DeltaCopyFileView( uint64_t offset, uint64_t viewSize )
 
 int DeltaCopy()
 {
-	// Assume that most machines in the wild have at least 2 cores in 2022.
-	const size_t ioThreadCount = max( 1, min( s_state.sysInfo.dwNumberOfProcessors / 4, IO_THREAD_MAX_COUNT ) );
+	const BOOL srcIsNetworkPath = PathIsNetworkPath( s_state.srcFilePathAbsolute );
+	const BOOL dstIsNetworkPath = PathIsNetworkPath( s_state.dstFilePathAbsolute );
+
+	// Assume that most machines in the wild have at least 2 cores in 2022. However, if either the source or destination files are network resources,
+	// force single threaded mode because network I/O does not work well with high QD/random access the way multiple threads would create.
+	const size_t ioThreadCount = (srcIsNetworkPath || dstIsNetworkPath) ? 1 : max( 1, min( s_state.sysInfo.dwNumberOfProcessors / 4, IO_THREAD_MAX_COUNT ) );
 
 	s_state.srcFileHnd = CreateFile( s_state.srcFilePathAbsolute, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
 	if ( s_state.srcFileHnd == INVALID_HANDLE_VALUE )
@@ -408,14 +463,18 @@ int DeltaCopy()
 	s_state.flushThreadNeeded = true;
 	std::thread flushThread( FlushFileThread );
 
+	std::thread ioThreads[IO_THREAD_MAX_COUNT];
+	s_sharedIOThreadState.threadCount = ioThreadCount;
+	for ( uint64_t threadIdx = 0; threadIdx < ioThreadCount; ++threadIdx )
+		ioThreads[threadIdx] = std::thread( BlockCopyThread, threadIdx );
+
 	const size_t viewCount = srcFileSize.QuadPart / FILE_MAP_VIEW_SIZE;
 	for ( size_t viewIdx = 0; viewIdx < viewCount; ++viewIdx )
 	{
 		DeltaCopyFileView( viewIdx * FILE_MAP_VIEW_SIZE, FILE_MAP_VIEW_SIZE );
 		//printf( "Processed %.2lf%% of file\n", static_cast< double >(viewIdx * FILE_MAP_VIEW_SIZE) / static_cast< double >(srcFileSize.QuadPart) );
 	}
-		
-
+	
 	const size_t lastViewSize = srcFileSize.QuadPart - viewCount * FILE_MAP_VIEW_SIZE;
 	if ( viewCount * FILE_MAP_VIEW_SIZE < static_cast< size_t >( srcFileSize.QuadPart ) )
 		DeltaCopyFileView( viewCount * FILE_MAP_VIEW_SIZE, lastViewSize );
@@ -424,6 +483,11 @@ int DeltaCopy()
 	s_state.flushThreadNeeded = false;
 	s_state.flushRequested.release();
 	flushThread.join();
+
+	s_sharedIOThreadState.threadCount = 0;
+	s_sharedIOThreadState.pendingIOWork.release( ioThreadCount );
+	for ( size_t threadIdx = 0; threadIdx < ioThreadCount; ++threadIdx )
+		ioThreads[threadIdx].join();
 
 	SYSTEMTIME systemTime;
 	GetSystemTime( &systemTime );
