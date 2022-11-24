@@ -80,6 +80,9 @@
   <ItemGroup>
     <ClCompile Include="deltacopy.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="xxhash.hpp" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

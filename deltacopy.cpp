@@ -1,15 +1,15 @@
-#define WIN32_LEAN_AND_MEAN
-#define VC_EXTRALEAN
-#include <Windows.h>
-#include <Shlwapi.h>
-
 #include <cstdio>
 #include <inttypes.h>
 
 #include <thread>
 #include <semaphore>
 
-#define PREFETCH( location ) _mm_prefetch( location, _MM_HINT_T0 )
+#include "xxhash.hpp"
+
+#define WIN32_LEAN_AND_MEAN
+#define VC_EXTRALEAN
+#include <Windows.h>
+#include <Shlwapi.h>
 
 constexpr size_t KiB = 1024;
 constexpr size_t MiB = 1024 * KiB;
@@ -32,11 +32,11 @@ constexpr size_t MAX_COPYABLE_FILE_SIZE = WINDOWS_REQUIRED_MAX_ADDRESS_SPACE / 2
 
 // Limit how large the block hash metadata file can be. This excludes the header size so actual max size will
 // be FILE_BLOCK_HASH_MAX_SIZE + sizeof(FileBlockHashHeader_s) - sizeof(Hash).
-constexpr size_t FILE_BLOCK_HASH_MAX_SIZE = 16_MiB;
+constexpr size_t FILE_BLOCK_HASH_MAX_SIZE = 32_MiB;
 static_assert(FILE_BLOCK_HASH_MAX_SIZE < 2_GiB, "FILE_BLOCK_HASH_MAX_SIZE must be less than 2GiB due to synchronous ReadFile constraints.");
 
 // Determine how many hashes can be supported by the target metadata file size.
-typedef uint32_t Hash;
+typedef xxh::hash64_t Hash;
 constexpr size_t FILE_BLOCK_HASH_MAX_HASH_COUNT = FILE_BLOCK_HASH_MAX_SIZE / sizeof( Hash );
 
 // Determine the block sizes to be hashed based on max copyable file size, ceiled to the nearest 4KiB.
@@ -48,7 +48,7 @@ constexpr wchar_t FILE_BLOCK_HASH_FILE_EXT[] = L".fbh";
 // so multiple threads are likely to be I/O starved.
 constexpr size_t IO_THREAD_MAX_COUNT = 8;
 
-// Number of blocks processed by each IO thread.
+// Number of blocks processed by each IO thread. This is inferred later when IO threads auto-partition workloads.
 constexpr size_t BLOCKS_PER_IO_THREAD = 8;
 
 // How big to make a file map so the system doesn't use up crazy amounts of memory. This can still be quite big.
@@ -67,8 +67,9 @@ Copying directories is currently unsupported.
 enum FileBlockHashHeaderVersion_e
 {
 	FBH_HEADER_INITIAL_VERSION,
+	FBH_HEADER_SWITCHED_TO_XXHASH,
 	FBH_HEADER_VERSION_COUNT,
-	FBH_HEADER_CURRENT_VERSION = FBH_HEADER_INITIAL_VERSION,
+	FBH_HEADER_CURRENT_VERSION = FBH_HEADER_SWITCHED_TO_XXHASH,
 };
 
 struct FileBlockHashHeader_s
@@ -78,7 +79,7 @@ struct FileBlockHashHeader_s
 	uint64_t srcFileTimestamp;
 
 	uint64_t blockCount;
-	uint32_t blockHashes[VARIABLE_LENGTH_ARRAY];
+	Hash blockHashes[VARIABLE_LENGTH_ARRAY];
 };
 
 static struct
@@ -125,103 +126,6 @@ static struct
 
 	uint64_t baseBlockIdx;
 } s_sharedIOThreadState;
-
-// ================================== CRC-32 from Stephan Baume ==================================
-// Modified to be simpler to integrate in this code.
-constexpr uint32_t CRC32Polynomial = 0xEDB88320;
-uint32_t Crc32Lookup[16][256];
-void crc32_precompute_lookup_table()
-{
-	// my improvement of Wolf's code
-	// approx. 0.18 nanoseconds on my PC / GCC9-x64
-	Crc32Lookup[0][0] = 0;
-	// compute each power of two (all numbers with exactly one bit set)
-	uint32_t crc = Crc32Lookup[0][0x80] = CRC32Polynomial;
-	for ( uint32_t next = 0x40; next != 0; next >>= 1 )
-	{
-		crc = (crc >> 1) ^ ((crc & 1) * CRC32Polynomial);
-		Crc32Lookup[0][next] = crc;
-	}
-	// the main idea is:
-	// table[a ^ b] = table[a] ^ table[b];
-	// therefore if we know all values up to a power of two called x
-	// we can compute table[x + y] where x > y:
-	// table[x + y] = table[x ^ y] = table[x] ^ table[y]
-	// example:
-	// the previous loop computed table[1] and table[2],
-	// so that x = 2 (a power of two) and y = 1 (fulfilling x > y)
-	// now x + y = x ^ y = 2 + 1 = 2 ^ 1
-	// and table[x + y] = table[x ^ y] = table[x] ^ table[y]
-	// which means table[3] = table[2] ^ table[1]
-	// compute all values between two powers of two
-	// i.e. 3, 5,6,7, 9,10,11,12,13,14,15, 17,...
-	for ( uint32_t powerOfTwo = 2; powerOfTwo <= 0x80; powerOfTwo <<= 1 )
-	{
-		uint32_t crcExtraBit = Crc32Lookup[0][powerOfTwo];
-		for ( uint32_t i = 1; i < powerOfTwo; i++ )
-			Crc32Lookup[0][i + powerOfTwo] = Crc32Lookup[0][i] ^ crcExtraBit;
-	}
-
-	for ( int slice = 1; slice < 16; slice++ )
-	{
-		for ( uint32_t i = 0; i < 256; ++i )
-			Crc32Lookup[slice][i] = (Crc32Lookup[slice - 1][i] >> 8) ^ Crc32Lookup[0][Crc32Lookup[slice - 1][i] & 0xFF];
-	}
-		 
-}
-
-/// compute CRC32 (Slicing-by-16 algorithm, prefetch upcoming data blocks)
-uint32_t crc32_16bytes_prefetch( const void* data, size_t length, uint32_t previousCrc32, size_t prefetchAhead )
-{
-	// CRC code is identical to crc32_16bytes (including unrolling), only added prefetching
-	// 256 bytes look-ahead seems to be the sweet spot on Core i7 CPUs
-
-	uint32_t crc = ~previousCrc32; // same as previousCrc32 ^ 0xFFFFFFFF
-	const uint32_t* current = (const uint32_t*)data;
-
-	// enabling optimization (at least -O2) automatically unrolls the for-loop
-	const size_t Unroll = 4;
-	const size_t BytesAtOnce = 16 * Unroll;
-
-	while ( length >= BytesAtOnce + prefetchAhead )
-	{
-		PREFETCH( ((const char*)current) + prefetchAhead );
-
-		for ( size_t unrolling = 0; unrolling < Unroll; unrolling++ )
-		{
-			uint32_t one = *current++ ^ crc;
-			uint32_t two = *current++;
-			uint32_t three = *current++;
-			uint32_t four = *current++;
-			crc = Crc32Lookup[0][(four >> 24) & 0xFF] ^
-				Crc32Lookup[1][(four >> 16) & 0xFF] ^
-				Crc32Lookup[2][(four >> 8) & 0xFF] ^
-				Crc32Lookup[3][four & 0xFF] ^
-				Crc32Lookup[4][(three >> 24) & 0xFF] ^
-				Crc32Lookup[5][(three >> 16) & 0xFF] ^
-				Crc32Lookup[6][(three >> 8) & 0xFF] ^
-				Crc32Lookup[7][three & 0xFF] ^
-				Crc32Lookup[8][(two >> 24) & 0xFF] ^
-				Crc32Lookup[9][(two >> 16) & 0xFF] ^
-				Crc32Lookup[10][(two >> 8) & 0xFF] ^
-				Crc32Lookup[11][two & 0xFF] ^
-				Crc32Lookup[12][(one >> 24) & 0xFF] ^
-				Crc32Lookup[13][(one >> 16) & 0xFF] ^
-				Crc32Lookup[14][(one >> 8) & 0xFF] ^
-				Crc32Lookup[15][one & 0xFF];
-		}
-
-		length -= BytesAtOnce;
-	}
-
-	const uint8_t* currentChar = (const uint8_t*)current;
-	// remaining 1 to 63 bytes (standard algorithm)
-	while ( length-- != 0 )
-		crc = (crc >> 8) ^ Crc32Lookup[0][(crc & 0xFF) ^ *currentChar++];
-
-	return ~crc; // same as crc ^ 0xFFFFFFFF
-}
-// ================================== CRC-32 from Stephan Baume ==================================
 
 const char* PrettyFormatSize( uint64_t size, double* outPrettySize )
 {
@@ -287,8 +191,8 @@ void BlockCopyThread(uint64_t threadIdx)
 		for ( size_t currBlockIdx = blockStartIdx; currBlockIdx < blockEndIdx; ++currBlockIdx )
 		{
 			const size_t actualBlockIdx = s_sharedIOThreadState.baseBlockIdx + currBlockIdx;
-			const uint32_t crc32 = crc32_16bytes_prefetch( s_state.srcFileBytes + FILE_BLOCK_SIZE * currBlockIdx, FILE_BLOCK_SIZE, 0, 256 );
-			if ( actualBlockIdx >= s_state.dstFileBlockHashData->blockCount || crc32 != s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] )
+			const Hash blockHash = xxh::xxhash3<64>( s_state.srcFileBytes + FILE_BLOCK_SIZE * currBlockIdx, FILE_BLOCK_SIZE );
+			if ( actualBlockIdx >= s_state.dstFileBlockHashData->blockCount || blockHash != s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] )
 			{
 				printf( "Block %llu differs, copying...\n", actualBlockIdx );
 				memcpy( s_state.dstFileBytes + FILE_BLOCK_SIZE * currBlockIdx, s_state.srcFileBytes + FILE_BLOCK_SIZE * currBlockIdx, FILE_BLOCK_SIZE );
@@ -298,7 +202,7 @@ void BlockCopyThread(uint64_t threadIdx)
 			{
 				printf( "Block %llu has no changes, skipping.\n", actualBlockIdx );
 			}
-			s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] = crc32;
+			s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] = blockHash;
 		}
 
 		if ( threadIdx == s_sharedIOThreadState.threadCount - 1 )
@@ -341,8 +245,8 @@ inline void DeltaCopyFileView( uint64_t offset, uint64_t viewSize )
 		const size_t actualBlockIdx = offset / FILE_BLOCK_SIZE + blockIdx;
 
 		const size_t lastBlockSize = viewSize - FILE_BLOCK_SIZE * blockIdx;
-		const uint32_t crc32 = crc32_16bytes_prefetch( s_state.srcFileBytes + FILE_BLOCK_SIZE * blockIdx, lastBlockSize, 0, 256 );
-		if ( actualBlockIdx >= s_state.dstFileBlockHashData->blockCount || crc32 != s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] )
+		const Hash blockHash = xxh::xxhash3<64>( s_state.srcFileBytes + FILE_BLOCK_SIZE * blockIdx, lastBlockSize );
+		if ( actualBlockIdx >= s_state.dstFileBlockHashData->blockCount || blockHash != s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] )
 		{
 			printf( "Block %llu differs, copying...", actualBlockIdx );
 			memcpy( s_state.dstFileBytes + FILE_BLOCK_SIZE * blockIdx, s_state.srcFileBytes + FILE_BLOCK_SIZE * blockIdx, lastBlockSize );
@@ -354,7 +258,7 @@ inline void DeltaCopyFileView( uint64_t offset, uint64_t viewSize )
 			printf( "Block %llu has no changes, skipping.\n", actualBlockIdx );
 		}
 
-		s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] = crc32;
+		s_state.dstFileBlockHashData->blockHashes[actualBlockIdx] = blockHash;
 	}
 
 	if ( s_state.dstFileBytesToFlush != nullptr )
@@ -429,6 +333,13 @@ int DeltaCopy()
 		return 1;
 	}
 
+	if ( s_state.dstFileBlockHashData->headerVersion != FBH_HEADER_CURRENT_VERSION )
+	{
+		// Do migration if possible, else just nuke the hash state.
+
+		memset( s_state.dstFileBlockHashData, 0, fileBlockHashFileSize );
+	}
+
 	FILETIME srcFileTime;
 	GetFileTime( s_state.srcFileHnd, nullptr, nullptr, &srcFileTime );
 
@@ -457,8 +368,6 @@ int DeltaCopy()
 
 	//MEMORY_BASIC_INFORMATION mappedDstInfo;
 	//VirtualQuery( s_state.dstFileBytes, &mappedDstInfo, sizeof( mappedDstInfo ) );
-
-	crc32_precompute_lookup_table();
 
 	s_state.flushThreadNeeded = true;
 	std::thread flushThread( FlushFileThread );
