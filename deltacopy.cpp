@@ -11,6 +11,8 @@
 #include <Windows.h>
 #include <Shlwapi.h>
 
+#pragma warning(default : 4820)
+
 constexpr size_t KiB = 1024;
 constexpr size_t MiB = 1024 * KiB;
 constexpr size_t GiB = 1024 * MiB;
@@ -37,7 +39,7 @@ static_assert(FILE_BLOCK_HASH_MAX_SIZE < 2_GiB, "FILE_BLOCK_HASH_MAX_SIZE must b
 
 // Determine how many hashes can be supported by the target metadata file size.
 typedef xxh::hash64_t Hash;
-constexpr size_t FILE_BLOCK_HASH_MAX_HASH_COUNT = FILE_BLOCK_HASH_MAX_SIZE / sizeof( Hash );
+constexpr uint64_t FILE_BLOCK_HASH_MAX_HASH_COUNT = FILE_BLOCK_HASH_MAX_SIZE / sizeof( Hash );
 
 // Determine the block sizes to be hashed based on max copyable file size, ceiled to the nearest 4KiB.
 constexpr int64_t FILE_BLOCK_SIZE = ((MAX_COPYABLE_FILE_SIZE / FILE_BLOCK_HASH_MAX_HASH_COUNT + 4_KiB - 1) / 4_KiB) * 4_KiB;
@@ -55,6 +57,12 @@ constexpr size_t BLOCKS_PER_IO_THREAD = 8;
 constexpr size_t FILE_MAP_VIEW_SIZE = IO_THREAD_MAX_COUNT * BLOCKS_PER_IO_THREAD * FILE_BLOCK_SIZE;
 static_assert(FILE_MAP_VIEW_SIZE < 2_GiB, "File map view size must be less than 2GB due to Win32 API constraints.");
 
+// Given the massive block sizes being hashed here, hash collisions are inevitable, but copying the entire file every single
+// time defeats the point of delta copying, so what to do? Until inspiration strikes, spread the full file copy over multiple
+// copy sessions so no single copy operation has to do the entire file but enough repeat copies will eventually re-copy all 
+// older portions of the source file.
+constexpr size_t FILE_INTEGRITY_COPY_SESSION_COUNT = 25;
+
 constexpr char HELP_TEXT[] = R"(
 ==============================================================================
 deltacopy usage:
@@ -68,15 +76,36 @@ enum FileBlockHashHeaderVersion_e
 {
 	FBH_HEADER_INITIAL_VERSION,
 	FBH_HEADER_SWITCHED_TO_XXHASH,
+	FBH_ENSURE_FILE_INTEGRITY,
 	FBH_HEADER_VERSION_COUNT,
-	FBH_HEADER_CURRENT_VERSION = FBH_HEADER_SWITCHED_TO_XXHASH,
+	FBH_HEADER_CURRENT_VERSION = FBH_ENSURE_FILE_INTEGRITY,
+};
+
+struct FileBlockHashHeader_xxHashVersion_s
+{
+	uint32_t headerVersion;
+	uint8_t unusedPadding[4];
+
+	uint64_t srcFileTimestamp;
+
+	uint64_t blockCount;
+	Hash blockHashes[VARIABLE_LENGTH_ARRAY];
 };
 
 struct FileBlockHashHeader_s
 {
 	uint32_t headerVersion;
-	
+	uint8_t unusedPadding[4];
+
 	uint64_t srcFileTimestamp;
+
+	// Integrity copying tracks block count separately from the block count for hashes because we want to make sure
+	// all existing blocks are copied over the course of FILE_INTEGRITY_COPY_SESSION_COUNT since they are more likely
+	// to suffer from being out of date against the source file due to hash collisions.
+	uint64_t integrityFileBlockCount;
+	uint64_t integrityBlockStart;
+
+	uint8_t reservedBytes[128];
 
 	uint64_t blockCount;
 	Hash blockHashes[VARIABLE_LENGTH_ARRAY];
@@ -112,6 +141,7 @@ static struct
 	std::binary_semaphore flushRequested = std::binary_semaphore{ 0 };
 	std::binary_semaphore flushDone = std::binary_semaphore{ 0 };
 	bool flushThreadNeeded = false;
+	uint8_t _padding[5];
 
 	size_t totalBytesWritten = 0;
 } s_state;
@@ -120,6 +150,8 @@ static struct
 {
 	std::counting_semaphore< IO_THREAD_MAX_COUNT > pendingIOWork{ 0 };
 	std::binary_semaphore pendingIOWorkComplete{ 0 };
+	uint8_t _padding[7];
+
 	size_t threadCount = 0;
 
 	uint64_t blockCount;
@@ -336,8 +368,34 @@ int DeltaCopy()
 	if ( s_state.dstFileBlockHashData->headerVersion != FBH_HEADER_CURRENT_VERSION )
 	{
 		// Do migration if possible, else just nuke the hash state.
+		if ( s_state.dstFileBlockHashData->headerVersion == FBH_HEADER_SWITCHED_TO_XXHASH && FBH_HEADER_CURRENT_VERSION == FBH_ENSURE_FILE_INTEGRITY )
+		{
+			FileBlockHashHeader_xxHashVersion_s* legacyHeader = reinterpret_cast< FileBlockHashHeader_xxHashVersion_s* >(s_state.dstFileBlockHashData);
+			memmove( &s_state.dstFileBlockHashData->blockCount, &legacyHeader->blockCount, sizeof( legacyHeader->blockCount ) + legacyHeader->blockCount * sizeof( legacyHeader->blockHashes[0] ) );
+			s_state.dstFileBlockHashData->integrityFileBlockCount = blockCount;
+			s_state.dstFileBlockHashData->integrityBlockStart = 0;
+		}
+		else
+		{
+			memset( s_state.dstFileBlockHashData, 0, fileBlockHashFileSize );
+		}
+	}
 
-		memset( s_state.dstFileBlockHashData, 0, fileBlockHashFileSize );
+	// Invalidate the hashes for the integrity blocks so those blocks are forced to be copied.
+	const uint64_t integrityBlockStart = min( blockCount, s_state.dstFileBlockHashData->integrityBlockStart );
+	const uint64_t integrityBlockEnd = min( blockCount, integrityBlockStart + min( blockCount, (s_state.dstFileBlockHashData->integrityFileBlockCount / FILE_INTEGRITY_COPY_SESSION_COUNT) + 1 ) );
+	if ( integrityBlockStart != integrityBlockEnd )
+	{
+		printf( "Invalidating hashes for blocks [%llu - %llu) as part of file integrity assurance to force those blocks to be copied.\n", integrityBlockStart, integrityBlockEnd );
+		memset( &s_state.dstFileBlockHashData->blockHashes[integrityBlockStart], 0, (integrityBlockEnd - integrityBlockStart) * sizeof( s_state.dstFileBlockHashData->blockHashes[0] ) );
+	}
+	
+	// Update integrity metadata for next copy.
+	s_state.dstFileBlockHashData->integrityBlockStart = integrityBlockEnd;
+	if ( integrityBlockEnd == blockCount )
+	{
+		s_state.dstFileBlockHashData->integrityBlockStart = 0;
+		s_state.dstFileBlockHashData->integrityFileBlockCount = blockCount;
 	}
 
 	FILETIME srcFileTime;
