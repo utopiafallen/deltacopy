@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <inttypes.h>
 
+#include <random>
 #include <thread>
 #include <semaphore>
 
@@ -23,6 +24,12 @@ constexpr size_t operator "" _MiB( size_t val ) { return val * MiB; }
 constexpr size_t operator "" _GiB( size_t val ) { return val * GiB; }
 constexpr size_t operator "" _TiB( size_t val ) { return val * TiB; }
 
+template <typename T>
+constexpr T ipow( T num, unsigned int pow )
+{
+	return pow == 0 ? 1 : num * ipow( num, pow - 1 );
+}
+
 constexpr size_t VARIABLE_LENGTH_ARRAY = 1;
 
 // Starting with 64-bit Windows 8.1/Windows Server 2012 R2. Not sure where the 128KiB comes from.
@@ -33,13 +40,13 @@ constexpr size_t WINDOWS_REQUIRED_MAX_ADDRESS_SPACE = 128_TiB - 128_KiB;
 constexpr size_t MAX_COPYABLE_FILE_SIZE = WINDOWS_REQUIRED_MAX_ADDRESS_SPACE / 2;
 
 // Limit how large the block hash metadata file can be. This excludes the header size so actual max size will
-// be FILE_BLOCK_HASH_MAX_SIZE + sizeof(FileBlockHashHeader_s) - sizeof(Hash).
-constexpr size_t FILE_BLOCK_HASH_MAX_SIZE = 32_MiB;
-static_assert(FILE_BLOCK_HASH_MAX_SIZE < 2_GiB, "FILE_BLOCK_HASH_MAX_SIZE must be less than 2GiB due to synchronous ReadFile constraints.");
+// be FILE_BLOCK_HASH_HEADER_FILE_MAX_SIZE + sizeof(FileBlockHashHeader_s) - sizeof(Hash).
+constexpr size_t FILE_BLOCK_HASH_HEADER_FILE_MAX_SIZE = 32_MiB;
+static_assert(FILE_BLOCK_HASH_HEADER_FILE_MAX_SIZE < 2_GiB, "FILE_BLOCK_HASH_HEADER_FILE_MAX_SIZE must be less than 2GiB due to synchronous ReadFile constraints.");
 
 // Determine how many hashes can be supported by the target metadata file size.
 typedef xxh::hash64_t Hash;
-constexpr uint64_t FILE_BLOCK_HASH_MAX_HASH_COUNT = FILE_BLOCK_HASH_MAX_SIZE / sizeof( Hash );
+constexpr uint64_t FILE_BLOCK_HASH_MAX_HASH_COUNT = FILE_BLOCK_HASH_HEADER_FILE_MAX_SIZE / sizeof( Hash );
 
 // Determine the block sizes to be hashed based on max copyable file size, ceiled to the nearest 4KiB.
 constexpr int64_t FILE_BLOCK_SIZE = ((MAX_COPYABLE_FILE_SIZE / FILE_BLOCK_HASH_MAX_HASH_COUNT + 4_KiB - 1) / 4_KiB) * 4_KiB;
@@ -57,11 +64,43 @@ constexpr size_t BLOCKS_PER_IO_THREAD = 8;
 constexpr size_t FILE_MAP_VIEW_SIZE = IO_THREAD_MAX_COUNT * BLOCKS_PER_IO_THREAD * FILE_BLOCK_SIZE;
 static_assert(FILE_MAP_VIEW_SIZE < 2_GiB, "File map view size must be less than 2GB due to Win32 API constraints.");
 
-// Given the massive block sizes being hashed here, hash collisions are inevitable, but copying the entire file every single
-// time defeats the point of delta copying, so what to do? Until inspiration strikes, spread the full file copy over multiple
-// copy sessions so no single copy operation has to do the entire file but enough repeat copies will eventually re-copy all 
-// older portions of the source file.
-constexpr size_t FILE_INTEGRITY_COPY_SESSION_COUNT = 25;
+constexpr uint64_t HASH_BITS = sizeof( Hash ) * 8;
+
+// Birthday paradox (and the derivative birthday attack) tells us that for an n-bit hash, ~2^(n/2) input items are needed for a 50%
+// chance at hash collision (see Wikipedia for source citation).
+constexpr uint64_t BIRTHDAY_BOUND = HASH_BITS / 2;
+
+// Based on the birthday bound, this is the number of inputs that have to be hashed before a collision is basically guaranteed.
+constexpr uint64_t HASH_COLLISION_ITEM_COUNT = ipow( 2ull, BIRTHDAY_BOUND );
+
+// Assuming a perfect hash with uniform distribution, a hash function producing n-bit outputs should only consume n-bit inputs because
+// inputs greater than n-bits are guaranteed to have a collision by the pigeonhole principle (there are more inputs than available 
+// outputs to map to). Another way to think about this in the context file hashing is that every n-bits of file input is an item to be hashed
+// and counts towards the HASH_COLLISION_ITEM_COUNT threshold. 
+// 
+// Using a specific example:
+//	1. Hash function produces a 64-bit output.
+//	2. Birthday bound gives 32-bits of items before 50% collision rate, i.e. 2^32 items.
+//	3. Assuming perfect hash, a hash function producing 64-bit outputs should only operate on 64-bit inputs i.e. 8 byte chunks.
+//	4. 8 bytes chunks * BIRTHDAY_BOUND = 32GB can be hashed before a collision has a 50% chance of occuring (effectively guaranteed at that point).
+//
+// That said, in the context of file integrity, only behavior at the block level matters and each block is independent of the other
+// blocks so two blocks hashing to the same value is irrelevant. What matters is whether edits to a block generate hash collisions
+// and defending against such edit collisions. Since the only way to actually catch edit-based collisions would be to read the
+// destination file and compare against the input file, thereby defeating much of the point of delta copies, the next best defense
+// is to periodically re-copy a block so that any missed copies due to false hash collisions are made up for. 
+
+// In order to determine the frequency at which a block should be re-copied (copying every single time would again defeat the point
+// of delta copies), treat each n-bit input chunk as a hash item and count how many items are consumed hashing a single block. Then
+// the BIRTHDAY_BOUND gives the total number of times the block can be hashed before a collision should be assumed.
+constexpr uint64_t HASH_COLLISION_ITEMS_PER_BLOCK = FILE_BLOCK_SIZE / sizeof( Hash );
+constexpr uint64_t FILE_BLOCK_SAFE_HASH_COUNT = HASH_COLLISION_ITEM_COUNT / HASH_COLLISION_ITEMS_PER_BLOCK;
+
+// To avoid needing to track the hash count for each block and to avoid having to re-copy huge swaths of the source file all at once
+// (all the file blocks from the initial copy will have the same hash count and will increment hash counts at the same time so 
+// eventually, all of the initial file has to be re-copied), treat each block as having 1 / FILE_BLOCK_SAFE_HASH_COUNT probability
+// of being stale.
+constexpr float FILE_BLOCK_HASH_INVALIDATION_PROBABILITY = 1.0f / static_cast< float >( FILE_BLOCK_SAFE_HASH_COUNT );
 
 constexpr char HELP_TEXT[] = R"(
 ==============================================================================
@@ -74,11 +113,12 @@ Copying directories is currently unsupported.
 
 enum FileBlockHashHeaderVersion_e
 {
-	FBH_HEADER_INITIAL_VERSION,
-	FBH_HEADER_SWITCHED_TO_XXHASH,
-	FBH_ENSURE_FILE_INTEGRITY,
+	FBH_HEADER_VERSION_INITIAL,
+	FBH_HEADER_VERSION_SWITCHED_TO_XXHASH,
+	FBH_HEADER_VERSION_ENSURE_FILE_INTEGRITY,
+	FBH_HEADER_VERSION_STOCHASTIC_FILE_INTEGRITY,
 	FBH_HEADER_VERSION_COUNT,
-	FBH_HEADER_CURRENT_VERSION = FBH_ENSURE_FILE_INTEGRITY,
+	FBH_HEADER_VERSION_CURRENT = FBH_HEADER_VERSION_STOCHASTIC_FILE_INTEGRITY,
 };
 
 struct FileBlockHashHeader_xxHashVersion_s
@@ -92,7 +132,7 @@ struct FileBlockHashHeader_xxHashVersion_s
 	Hash blockHashes[VARIABLE_LENGTH_ARRAY];
 };
 
-struct FileBlockHashHeader_s
+struct FileBlockHashHeader_EnsureFileIntegrityVersion_s
 {
 	uint32_t headerVersion;
 	uint8_t unusedPadding[4];
@@ -106,6 +146,19 @@ struct FileBlockHashHeader_s
 	uint64_t integrityBlockStart;
 
 	uint8_t reservedBytes[128];
+
+	uint64_t blockCount;
+	Hash blockHashes[VARIABLE_LENGTH_ARRAY];
+};
+
+struct FileBlockHashHeader_s
+{
+	uint32_t headerVersion;
+	uint8_t unusedPadding[4];
+
+	uint64_t srcFileTimestamp;
+
+	uint8_t reservedBytes[144];
 
 	uint64_t blockCount;
 	Hash blockHashes[VARIABLE_LENGTH_ARRAY];
@@ -365,37 +418,32 @@ int DeltaCopy()
 		return 1;
 	}
 
-	if ( s_state.dstFileBlockHashData->headerVersion != FBH_HEADER_CURRENT_VERSION )
+	if ( s_state.dstFileBlockHashData->headerVersion != FBH_HEADER_VERSION_CURRENT )
 	{
 		// Do migration if possible, else just nuke the hash state.
-		if ( s_state.dstFileBlockHashData->headerVersion == FBH_HEADER_SWITCHED_TO_XXHASH && FBH_HEADER_CURRENT_VERSION == FBH_ENSURE_FILE_INTEGRITY )
+		if ( s_state.dstFileBlockHashData->headerVersion == FBH_HEADER_VERSION_SWITCHED_TO_XXHASH && FBH_HEADER_VERSION_CURRENT == FBH_HEADER_VERSION_STOCHASTIC_FILE_INTEGRITY )
 		{
 			FileBlockHashHeader_xxHashVersion_s* legacyHeader = reinterpret_cast< FileBlockHashHeader_xxHashVersion_s* >(s_state.dstFileBlockHashData);
 			memmove( &s_state.dstFileBlockHashData->blockCount, &legacyHeader->blockCount, sizeof( legacyHeader->blockCount ) + legacyHeader->blockCount * sizeof( legacyHeader->blockHashes[0] ) );
-			s_state.dstFileBlockHashData->integrityFileBlockCount = blockCount;
-			s_state.dstFileBlockHashData->integrityBlockStart = 0;
+		}
+		else if ( s_state.dstFileBlockHashData->headerVersion == FBH_HEADER_VERSION_ENSURE_FILE_INTEGRITY && FBH_HEADER_VERSION_CURRENT == FBH_HEADER_VERSION_STOCHASTIC_FILE_INTEGRITY )
+		{
+			// Do nothing, the legacy fields are just part of the reserved fields now.
 		}
 		else
 		{
 			memset( s_state.dstFileBlockHashData, 0, fileBlockHashFileSize );
 		}
 	}
-
-	// Invalidate the hashes for the integrity blocks so those blocks are forced to be copied.
-	const uint64_t integrityBlockStart = min( blockCount, s_state.dstFileBlockHashData->integrityBlockStart );
-	const uint64_t integrityBlockEnd = min( blockCount, integrityBlockStart + min( blockCount, (s_state.dstFileBlockHashData->integrityFileBlockCount / FILE_INTEGRITY_COPY_SESSION_COUNT) + 1 ) );
-	if ( integrityBlockStart != integrityBlockEnd )
-	{
-		printf( "Invalidating hashes for blocks [%llu - %llu) as part of file integrity assurance to force those blocks to be copied.\n", integrityBlockStart, integrityBlockEnd );
-		memset( &s_state.dstFileBlockHashData->blockHashes[integrityBlockStart], 0, (integrityBlockEnd - integrityBlockStart) * sizeof( s_state.dstFileBlockHashData->blockHashes[0] ) );
-	}
 	
-	// Update integrity metadata for next copy.
-	s_state.dstFileBlockHashData->integrityBlockStart = integrityBlockEnd;
-	if ( integrityBlockEnd == blockCount )
+	// Stochastic invalidation of block hashes to ensure file integrity over time.
+	std::random_device seed;
+	std::mt19937 generator( seed() );
+	std::uniform_real_distribution<float> rng;
+	for ( uint64_t blockIdx = 0; blockIdx < s_state.dstFileBlockHashData->blockCount; ++blockIdx )
 	{
-		s_state.dstFileBlockHashData->integrityBlockStart = 0;
-		s_state.dstFileBlockHashData->integrityFileBlockCount = blockCount;
+		if ( rng( generator ) <= FILE_BLOCK_HASH_INVALIDATION_PROBABILITY )
+			s_state.dstFileBlockHashData->blockHashes[blockIdx] = 0;
 	}
 
 	FILETIME srcFileTime;
@@ -472,7 +520,7 @@ int DeltaCopy()
 	double writtenPercent = static_cast< double >(s_state.totalBytesWritten) / static_cast< double >(srcFileSize.QuadPart) * 100.0;
 	printf( "Finished! Wrote %.2lf%s out of %.2lf%s which was %.2lf%% of original file size\n", prettyBytesWritten, prettyBytesWrittenSuffix, prettyFileSize, prettyFileSizeSuffix, writtenPercent );
 
-	s_state.dstFileBlockHashData->headerVersion = FBH_HEADER_CURRENT_VERSION;
+	s_state.dstFileBlockHashData->headerVersion = FBH_HEADER_VERSION_CURRENT;
 	s_state.dstFileBlockHashData->blockCount = blockCount;
 	s_state.dstFileBlockHashData->srcFileTimestamp = srcFileTimestamp;
 
